@@ -139,9 +139,33 @@ body{
 .reset{font-family:'DM Mono',monospace;font-size:.62rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted-2);background:none;border:1px solid var(--line);border-radius:99px;padding:8px 16px;cursor:pointer;transition:.15s}
 .reset:hover{color:var(--rose);border-color:var(--rose)}
 #toast{display:none;position:fixed;left:50%;bottom:40px;z-index:50;transform:translateX(-50%);background:linear-gradient(90deg,var(--gold),var(--rose));color:var(--plum-deep);font-family:'DM Mono',monospace;font-size:.8rem;letter-spacing:.06em;padding:10px 20px;border-radius:99px;box-shadow:0 8px 30px rgba(0,0,0,.4)}
+/* login gate */
+#gate{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:24px;background:radial-gradient(900px 560px at 50% -10%, rgba(127,245,208,.08), transparent 60%),linear-gradient(168deg,var(--plum-deep) 0%,var(--plum) 42%,var(--forest) 100%)}
+.gate-card{width:100%;max-width:360px;background:var(--surface-2);border:1px solid var(--line-gold);border-radius:18px;padding:30px 26px;text-align:center}
+.gate-script{font-family:'Great Vibes',cursive;font-size:2.2rem;color:var(--gold);line-height:1.15;margin-bottom:6px}
+.gate-sub{font-size:.62rem;letter-spacing:.22em;text-transform:uppercase;color:var(--muted);margin:14px 0 10px}
+#gate-pass{width:100%;padding:12px 14px;border-radius:10px;border:1px solid var(--line-strong);background:rgba(0,0,0,.25);color:var(--text);font-family:'Work Sans',sans-serif;font-size:1.05rem;text-align:center;outline:none}
+#gate-pass:focus{border-color:var(--mint)}
+#gate-btn{width:100%;margin-top:12px;padding:12px 14px;border-radius:10px;border:1px solid var(--line-gold);background:rgba(237,192,106,.12);color:var(--gold);font-family:'Work Sans',sans-serif;font-size:1.02rem;letter-spacing:.03em;cursor:pointer;transition:.2s}
+#gate-btn:hover{background:rgba(237,192,106,.2)}
+#gate-btn:disabled{opacity:.5;cursor:default}
+#gate-err{font-size:.62rem;letter-spacing:.14em;text-transform:uppercase;color:var(--rose);margin-top:12px;min-height:1em}
+.gate-note{font-size:.6rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted-2);margin-top:16px;line-height:1.6}
 </style>
 </head>
 <body>
+<div id="gate">
+  <div class="gate-card">
+    <div class="gate-script">Sopapillas &amp; Shenanigans</div>
+    <div class="mono gate-sub">Denver · Jul 7–11 · trip password</div>
+    <form id="gate-form">
+      <input id="gate-pass" type="password" autocomplete="current-password" placeholder="password"/>
+      <button id="gate-btn" type="submit">Let me in ✦</button>
+    </form>
+    <div id="gate-err" class="mono"></div>
+    <div class="mono gate-note">one password for both of us —<br/>you only enter it once per device</div>
+  </div>
+</div>
 <div class="wrap">
 
   <!-- HERO -->
@@ -369,6 +393,8 @@ body{
   var SB_KEY='sb_publishable_eimCwBt9wSEvHcXuPI4qiA_bfquy-n-';
   var TRIP='denver-2026';
   var BUCKET='trip-photos';
+  var SB_EMAIL='trip@denver2026.app';
+  var SIGN_TTL=60*60*24*365; // signed photo URLs stay valid for a year
 
   var state = { checks:{}, hunt:{}, bingo:{}, journal:{}, closing:'', photos:{}, dumpCount:0, ready:false, cloud:'local', collapsed:{}, autoDone:{} };
   var sb = null, _pt = null, _lastPush = 0;
@@ -534,17 +560,52 @@ body{
   }
   function initCloud(){
     return loadSupaLib().then(function(){
-      if(!window.supabase){ state.cloud='offline'; updateDerived(); return; }
+      if(!window.supabase){ state.cloud='offline'; hideGate(); updateDerived(); return; }
       sb=window.supabase.createClient(SB_URL,SB_KEY);
       state.cloud='connecting'; updateDerived();
-      return Promise.resolve(sb.from('trip_state').select('data').eq('id',TRIP).maybeSingle()).then(function(r){
-        if(r.error) throw r.error;
-        if(r.data&&r.data.data) applyRemote(r.data.data);
-        else sb.from('trip_state').upsert({id:TRIP,data:snapshot()});
-        sb.channel('trip-'+TRIP).on('postgres_changes',{event:'*',schema:'public',table:'trip_state',filter:'id=eq.'+TRIP},function(p){ if(Date.now()-_lastPush<2000) return; if(p&&p.new&&p.new.data) applyRemote(p.new.data); }).subscribe();
-        state.cloud='live'; updateDerived();
+      return Promise.resolve(sb.auth.getSession()).then(function(r){
+        if(r.data&&r.data.session){ hideGate(); return startSync(); }
+        showGate();
       });
+    }).catch(function(){ state.cloud='offline'; hideGate(); updateDerived(); });
+  }
+  function startSync(){
+    return Promise.resolve(sb.from('trip_state').select('data').eq('id',TRIP).maybeSingle()).then(function(r){
+      if(r.error) throw r.error;
+      if(r.data&&r.data.data) applyRemote(r.data.data);
+      else sb.from('trip_state').upsert({id:TRIP,data:snapshot()});
+      refreshPhotoUrls();
+      sb.channel('trip-'+TRIP).on('postgres_changes',{event:'*',schema:'public',table:'trip_state',filter:'id=eq.'+TRIP},function(p){ if(Date.now()-_lastPush<2000) return; if(p&&p.new&&p.new.data) applyRemote(p.new.data); }).subscribe();
+      state.cloud='live'; updateDerived();
     }).catch(function(){ state.cloud='offline'; updateDerived(); });
+  }
+  function refreshPhotoUrls(){
+    if(!sb) return;
+    Object.keys(state.photos).forEach(function(k){
+      var ph=state.photos[k]; if(!ph||!ph.path) return;
+      Promise.resolve(sb.storage.from(BUCKET).createSignedUrl(ph.path,SIGN_TTL)).then(function(su){
+        if(su&&su.data&&su.data.signedUrl&&state.photos[k]&&state.photos[k].path===ph.path){ state.photos[k].url=su.data.signedUrl; rerender(); }
+      }).catch(function(){});
+    });
+  }
+
+  // ---------- login gate ----------
+  function showGate(){ var g=$('#gate'); if(g){ g.style.display='flex'; var i=$('#gate-pass'); if(i) setTimeout(function(){ i.focus(); },50); } }
+  function hideGate(){ var g=$('#gate'); if(g) g.style.display='none'; }
+  function wireGate(){
+    var f=$('#gate-form'); if(!f) return;
+    f.addEventListener('submit', function(e){
+      e.preventDefault();
+      var pass=$('#gate-pass').value, err=$('#gate-err'), btn=$('#gate-btn');
+      if(!pass) return;
+      if(!sb){ err.textContent='still connecting — try again in a sec'; return; }
+      btn.disabled=true; err.textContent='';
+      Promise.resolve(sb.auth.signInWithPassword({email:SB_EMAIL,password:pass})).then(function(r){
+        btn.disabled=false;
+        if(r.error){ err.textContent='that’s not it — try again'; $('#gate-pass').select(); return; }
+        hideGate(); startSync();
+      }).catch(function(){ btn.disabled=false; err.textContent='network hiccup — try again'; });
+    });
   }
 
   // ---------- toggles ----------
@@ -575,7 +636,7 @@ body{
       var ext=((file.name||'').split('.').pop()||'jpg').toLowerCase();
       var path=TRIP+'/'+slot+'-'+Date.now()+'.'+ext;
       return Promise.resolve(sb.storage.from(BUCKET).upload(path,file,{upsert:true,contentType:file.type||'image/jpeg'})).then(function(up){
-        if(up&&!up.error){ var pub=sb.storage.from(BUCKET).getPublicUrl(path); state.photos[slot]={url:pub.data.publicUrl,path:path}; rerender(); pushState(); }
+        if(up&&!up.error){ return Promise.resolve(sb.storage.from(BUCKET).createSignedUrl(path,SIGN_TTL)).then(function(su){ if(su&&su.data&&su.data.signedUrl){ state.photos[slot]={url:su.data.signedUrl,path:path}; rerender(); pushState(); } }); }
       }).catch(function(){});
     });
   }
@@ -850,6 +911,7 @@ body{
     renderLegs();
     buildJournal();
     rerender();
+    wireGate();
     loadPhotos();
     initCloud();
   }
